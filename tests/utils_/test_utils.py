@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import pickle
-import socket
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +13,6 @@ from unittest.mock import patch
 import pytest
 import torch
 import yaml
-import zmq
 from transformers import AutoTokenizer
 from vllm_test_utils.monitor import monitor
 
@@ -23,37 +21,17 @@ from vllm.transformers_utils.detokenizer_utils import convert_ids_list_to_tokens
 
 from vllm.utils import (
     FlexibleArgumentParser,
-    MemorySnapshot,
-    PlaceholderModule,
     bind_kv_cache,
-    common_broadcastable_dtype,
-    current_stream,
-    get_open_port,
-    get_tcp_uri,
-    is_lossless_cast,
-    join_host_port,
-    make_zmq_path,
-    make_zmq_socket,
-    memory_profiling,
-    sha256,
-    split_host_port,
-    split_zmq_path,
     unique_filepath,
 )
-
-from ..utils import create_new_process_for_each_test
-
-
-def test_get_open_port(monkeypatch: pytest.MonkeyPatch):
-    with monkeypatch.context() as m:
-        m.setenv("VLLM_PORT", "5678")
-        # make sure we can get multiple ports, even if the env var is set
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s1:
-            s1.bind(("localhost", get_open_port()))
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
-                s2.bind(("localhost", get_open_port()))
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s3:
-                    s3.bind(("localhost", get_open_port()))
+from vllm.utils.hashing import sha256
+from vllm.utils.torch_utils import (
+    common_broadcastable_dtype,
+    current_stream,
+    is_lossless_cast,
+)
+from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
+from ..utils import create_new_process_for_each_test, flat_product
 
 
 # Tests for FlexibleArgumentParser
@@ -410,7 +388,7 @@ def test_bind_kv_cache_non_attention():
 
 
 def test_bind_kv_cache_pp():
-    with patch("vllm.utils.cuda_device_count_stateless", lambda: 2):
+    with patch("vllm.utils.torch_utils.cuda_device_count_stateless", lambda: 2):
         # this test runs with 1 GPU, but we simulate 2 GPUs
         cfg = VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=2))
     with set_current_vllm_config(cfg):
@@ -473,46 +451,6 @@ def test_is_lossless_cast(src_dtype, tgt_dtype, expected_result):
 )
 def test_common_broadcastable_dtype(dtypes, expected_result):
     assert common_broadcastable_dtype(dtypes) == expected_result
-
-
-def test_placeholder_module_error_handling():
-    placeholder = PlaceholderModule("placeholder_1234")
-
-    def build_ctx():
-        return pytest.raises(ModuleNotFoundError, match="No module named")
-
-    with build_ctx():
-        int(placeholder)
-
-    with build_ctx():
-        placeholder()
-
-    with build_ctx():
-        _ = placeholder.some_attr
-
-    with build_ctx():
-        # Test conflict with internal __name attribute
-        _ = placeholder.name
-
-    # OK to print the placeholder or use it in a f-string
-    _ = repr(placeholder)
-    _ = str(placeholder)
-
-    # No error yet; only error when it is used downstream
-    placeholder_attr = placeholder.placeholder_attr("attr")
-
-    with build_ctx():
-        int(placeholder_attr)
-
-    with build_ctx():
-        placeholder_attr()
-
-    with build_ctx():
-        _ = placeholder_attr.some_attr
-
-    with build_ctx():
-        # Test conflict with internal __module attribute
-        _ = placeholder_attr.module
 
 
 def test_model_specification(
@@ -612,104 +550,6 @@ def test_sha256(input: tuple):
 
     # hashing different input, returns different value
     assert digest != sha256(input + (1,))
-
-
-@pytest.mark.parametrize(
-    "path,expected",
-    [
-        ("ipc://some_path", ("ipc", "some_path", "")),
-        ("tcp://127.0.0.1:5555", ("tcp", "127.0.0.1", "5555")),
-        ("tcp://[::1]:5555", ("tcp", "::1", "5555")),  # IPv6 address
-        ("inproc://some_identifier", ("inproc", "some_identifier", "")),
-    ],
-)
-def test_split_zmq_path(path, expected):
-    assert split_zmq_path(path) == expected
-
-
-@pytest.mark.parametrize(
-    "invalid_path",
-    [
-        "invalid_path",  # Missing scheme
-        "tcp://127.0.0.1",  # Missing port
-        "tcp://[::1]",  # Missing port for IPv6
-        "tcp://:5555",  # Missing host
-    ],
-)
-def test_split_zmq_path_invalid(invalid_path):
-    with pytest.raises(ValueError):
-        split_zmq_path(invalid_path)
-
-
-def test_make_zmq_socket_ipv6():
-    # Check if IPv6 is supported by trying to create an IPv6 socket
-    try:
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        sock.close()
-    except socket.error:
-        pytest.skip("IPv6 is not supported on this system")
-
-    ctx = zmq.Context()
-    ipv6_path = "tcp://[::]:5555"  # IPv6 loopback address
-    socket_type = zmq.REP  # Example socket type
-
-    # Create the socket
-    zsock: zmq.Socket = make_zmq_socket(ctx, ipv6_path, socket_type)
-
-    # Verify that the IPV6 option is set
-    assert zsock.getsockopt(zmq.IPV6) == 1, (
-        "IPV6 option should be enabled for IPv6 addresses"
-    )
-
-    # Clean up
-    zsock.close()
-    ctx.term()
-
-
-def test_make_zmq_path():
-    assert make_zmq_path("tcp", "127.0.0.1", "5555") == "tcp://127.0.0.1:5555"
-    assert make_zmq_path("tcp", "::1", "5555") == "tcp://[::1]:5555"
-
-
-def test_get_tcp_uri():
-    assert get_tcp_uri("127.0.0.1", 5555) == "tcp://127.0.0.1:5555"
-    assert get_tcp_uri("::1", 5555) == "tcp://[::1]:5555"
-
-
-def test_split_host_port():
-    # valid ipv4
-    assert split_host_port("127.0.0.1:5555") == ("127.0.0.1", 5555)
-    # invalid ipv4
-    with pytest.raises(ValueError):
-        # multi colon
-        assert split_host_port("127.0.0.1::5555")
-    with pytest.raises(ValueError):
-        # tailing colon
-        assert split_host_port("127.0.0.1:5555:")
-    with pytest.raises(ValueError):
-        # no colon
-        assert split_host_port("127.0.0.15555")
-    with pytest.raises(ValueError):
-        # none int port
-        assert split_host_port("127.0.0.1:5555a")
-
-    # valid ipv6
-    assert split_host_port("[::1]:5555") == ("::1", 5555)
-    # invalid ipv6
-    with pytest.raises(ValueError):
-        # multi colon
-        assert split_host_port("[::1]::5555")
-    with pytest.raises(IndexError):
-        # no colon
-        assert split_host_port("[::1]5555")
-    with pytest.raises(ValueError):
-        # none int port
-        assert split_host_port("[::1]:5555a")
-
-
-def test_join_host_port():
-    assert join_host_port("127.0.0.1", 5555) == "127.0.0.1:5555"
-    assert join_host_port("::1", 5555) == "[::1]:5555"
 
 
 def test_convert_ids_list_to_tokens():
@@ -812,3 +652,25 @@ def test_unique_filepath():
         paths.add(path)
     assert len(paths) == 10
     assert len(list(Path(temp_dir).glob("*.txt"))) == 10
+
+
+def test_flat_product():
+    # Check regular itertools.product behavior
+    result1 = list(flat_product([1, 2, 3], ["a", "b"]))
+    assert result1 == [
+        (1, "a"),
+        (1, "b"),
+        (2, "a"),
+        (2, "b"),
+        (3, "a"),
+        (3, "b"),
+    ]
+
+    # check that the tuples get flattened
+    result2 = list(flat_product([(1, 2), (3, 4)], ["a", "b"], [(5, 6)]))
+    assert result2 == [
+        (1, 2, "a", 5, 6),
+        (1, 2, "b", 5, 6),
+        (3, 4, "a", 5, 6),
+        (3, 4, "b", 5, 6),
+    ]

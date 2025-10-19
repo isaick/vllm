@@ -12,7 +12,8 @@ from typing_extensions import Self
 import vllm.envs as envs
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.utils import GiB_bytes, get_cpu_memory
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import get_cpu_memory
 
 if TYPE_CHECKING:
     from vllm.config.parallel import ParallelConfig
